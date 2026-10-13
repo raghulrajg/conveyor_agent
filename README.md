@@ -94,7 +94,7 @@ Warnings:
 | `SWITCH_NO_ACK` | no `ok` within 10 s after `switch <product>` | OUTPUT 2 blinks until the part leaves; the cycle continues; result has `"switch_ok":false` |
 | `NO_PRODUCT` | part at the camera, no product name within 30 s | FAULT `NO_PRODUCT` (needs RESET) |
 | `PRODUCT_REJECTED` | product name empty, not a string, too long or with other characters than `A-Z a-z 0-9 space _ - .` | name ignored |
-| `PRODUCT_STALE` | the product name waited more than 120 s for a part | name discarded |
+| `PRODUCT_STALE` | the product name waited more than 120 s for a part (e.g. the job was cancelled) | name discarded, camera not switched |
 
 MQTT runs in its own thread with a 16-message queue. A WiFi or broker outage never stops the conveyor. Results are kept and sent when the connection is back.
 
@@ -103,10 +103,10 @@ MQTT runs in its own thread with a 16-message queue. A WiFi or broker outage nev
 Each product has its own program (solution) on the camera. The Opta switches the program for every part:
 
 1. The scheduler sends the product name of the part on `qc/qc_01/request` (it comes from the operator's message in the mobile app, e.g. "take ABCD from manufacturing_1 ..."). By hand: `python python/mqtt_monitor.py --product ABCD`, or `PRODUCT ABCD` in the Serial Monitor.
-2. **As soon as the name arrives** the Opta sends `switch ABCD` to the camera over the camera TCP link. It does not wait for the part to reach S2, so the program is normally loaded while the part is still on its way.
+2. **Once S1 has detected the part** and its name is known, the Opta sends `switch ABCD` to the camera over the camera TCP link. It does not wait for the part to reach S2, so the program is normally loaded while the part is still on its way. A name that arrives while the belt is empty waits for S1: a job cancelled before its part was put on the belt never switches the camera (its name is dropped after 120 s).
 3. It waits up to 10 s (from sending) for `ok` (any case). When the part has stopped at S2 it goes straight to the inspection if the `ok` is already in; otherwise it waits only for the rest of the 10 s. Then it triggers the camera (if `TRIGGER_TCP`) and waits for the result as before.
 4. No `ok` within 10 s: warning `SWITCH_NO_ACK` on the Serial Monitor and on `autonomous/product/Warning`, OUTPUT 2 blinks, and the cycle continues with `"switch_ok":false` in the result.
-5. The camera is never switched while it inspects a part: a name that arrives while a part waits for its result is switched right after that result.
+5. The camera is never switched while it inspects a part: a name that arrives while a part is at the camera waits for the next part's S1.
 
 **One product name = one cycle.** Every part needs its own product name. It may arrive before the part or while the part waits at the camera. A part at the camera waits up to 30 s for its name, then the conveyor faults (`NO_PRODUCT`). After a STOP the part on the belt keeps its name; after a FAULT RESET only a part still at the camera keeps it.
 
@@ -119,7 +119,7 @@ In SCMVS, set up the communication so that the string `switch <program>` loads t
 | IDLE | S1 detects the object **and** S3 is clear | ON |
 | RUN_TO_CAMERA | S2 detects the object | OFF |
 | SETTLE → WAIT_PRODUCT | wait for this part's product name (MQTT) | OFF |
-| SWITCH_PROGRAM | wait for the `ok` to the `switch <product>` sent when the name arrived (max 10 s from sending; no `ok` → warning, continue). Usually already in: no wait | OFF |
+| SWITCH_PROGRAM | wait for the `ok` to the `switch <product>` sent after S1 (max 10 s from sending; no `ok` → warning, continue). Usually already in: no wait | OFF |
 | WAIT_RESULT | wait for the camera result (optional trigger) | OFF |
 | result received | result is published to MQTT. If S3 is clear the motor starts; if S3 is occupied the conveyor waits | ON |
 | RUN_TO_EXIT | S3 detects the object | OFF |
@@ -281,7 +281,7 @@ python python/mqtt_monitor.py --test   # also sends one fake result (checks brok
 ## Verification status
 
 - All 4 sketches compile against the Arduino Mbed OS Opta core (M7). **The 3.1 changes (product name, program switch) were compiled and tested on a PC with stubbed Arduino/mbed APIs only, not yet with the Opta core: compile once in the Arduino IDE before uploading.**
-- **Program switch (3.1), PC simulation, both modes:** switch sent as soon as the name arrives (idle, part travelling, or part already at S2), no wait at S2 when the `ok` is already in, no switch during another part's inspection, `ok` in any case, data before the `ok` ignored, no `ok` → warning and the cycle continues, late `ok` not taken as a result, one product per cycle, no product → `NO_PRODUCT` fault, rejected and stale names, STOP/RESET keeping the name, camera offline at switch time. `fake_camera.py` answers `switch <product>` with `ok`.
+- **Program switch (3.1), PC simulation, both modes:** no switch with an empty belt, switch at S1 (or when the name arrives with the part already travelling or at S2), no wait at S2 when the `ok` is already in, no switch during another part's inspection, a cancelled job's name dropped without switching, `ok` in any case, data before the `ok` ignored, no `ok` → warning and the cycle continues, late `ok` not taken as a result, one product per cycle, no product → `NO_PRODUCT` fault, rejected and stale names, STOP/RESET keeping the name, camera offline at switch time. `fake_camera.py` answers `switch <product>` with `ok`.
 - On a PC simulation:
   - **Deploy sketches, both modes:** full sequence including OK, NG and invalid results, back-to-back messages, comma format, reconnect, `SIM`, and the MQTT JSON payloads. 115 checks passed. MQTT was tested against a stub, not a real broker.
   - **TCP test pairs:** 8/8 tests passed for each.

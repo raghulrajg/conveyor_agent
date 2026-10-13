@@ -21,7 +21,7 @@
      SETTLE          wait for the belt to stop
      WAIT_PRODUCT    wait for this part's product name (MQTT, every cycle)
      SWITCH_PROGRAM  wait until the camera has answered "ok" to the
-                     "switch <product>" sent when the name arrived
+                     "switch <product>" sent after S1 detected the part
                      (no "ok" within 10 s -> warning, the cycle continues)
      WAIT_RESULT     optionally trigger camera, wait for the camera result
      -> result       published to MQTT; S3 clear ................ motor ON
@@ -119,14 +119,15 @@
      Each product has its own program on the camera. Every cycle needs the
      product name of the part on the belt, received on MQTT_PRODUCT_TOPIC:
        {"product":"ABCD", ...}  (the scheduler's qc/qc_01/request)  or plain  ABCD
-     As soon as the name arrives the Opta sends  switch ABCD  to the camera
-     over the camera TCP link (not waiting for the part to reach S2), so the
-     program is normally loaded before the part gets there. It waits
+     Once S1 has detected the part (the cycle has started) and the name is
+     known, the Opta sends  switch ABCD  to the camera over the camera TCP
+     link, without waiting for the part to reach S2, so the program is
+     normally loaded before the part gets there. A name that arrives with
+     no part on the belt waits for S1: a job cancelled before its part was
+     put on the belt never switches the camera. It waits
      SWITCH_ACK_TIMEOUT_MS (10 s) for "ok". Without "ok" a warning is shown
      (OUTPUT 2 blinking) and published on MQTT_WARNING_TOPIC, and the cycle
-     continues; the result carries "switch_ok":false. The camera is never
-     switched while it is inspecting a part (SWITCH_PROGRAM / WAIT_RESULT):
-     the switch then goes out right after that part's result.
+     continues; the result carries "switch_ok":false.
      At S2 the part waits only for whatever is left of the 10 s.
      No product name within PRODUCT_WAIT_TIMEOUT_MS -> FAULT NO_PRODUCT.
      A product name is used for ONE cycle only. Serial command
@@ -887,22 +888,26 @@ bool handleProductMessage(const char* payload, const char* source) {
   strcpy(pendingProduct, name);
   pendingProductAt = millis();
   pendingSeq = ++productSeq;
-  pendingNeedsSwitch = true;                 // switched right away by serviceProgramSwitch()
+  pendingNeedsSwitch = true;                 // switched by serviceProgramSwitch() once S1 sees the part
   logEvent("PRODUCT", "\"%s\" received from %s (state %s)", pendingProduct, source, STATE_NAMES[state]);
   serviceProgramSwitch(millis());
   return true;
 }
 
 // Moves the pending product name into this cycle. False if there is none (or it is too old).
+// A name no part has used for PRODUCT_MAX_AGE_MS (e.g. its job was cancelled) is dropped.
+static bool dropStalePending(unsigned long now) {
+  if (!pendingProduct[0] || now - pendingProductAt <= PRODUCT_MAX_AGE_MS) return false;
+  publishWarning("PRODUCT_STALE", pendingProduct, "product \"%s\" discarded: received %lu s ago and no part used it",
+                 pendingProduct, (now - pendingProductAt) / 1000UL);
+  pendingProduct[0] = '\0';
+  pendingNeedsSwitch = false;
+  return true;
+}
+
 bool takePendingProduct(unsigned long now) {
+  dropStalePending(now);
   if (!pendingProduct[0]) return false;
-  if (now - pendingProductAt > PRODUCT_MAX_AGE_MS) {
-    publishWarning("PRODUCT_STALE", pendingProduct, "product \"%s\" discarded: received %lu s ago, before this part",
-                   pendingProduct, (now - pendingProductAt) / 1000UL);
-    pendingProduct[0] = '\0';
-    pendingNeedsSwitch = false;
-    return false;
-  }
   strcpy(cycleProduct, pendingProduct);
   cycleSeq = pendingSeq;
   cycleNeedsSwitch = pendingNeedsSwitch;
@@ -924,9 +929,10 @@ void startProgramSwitch(const char* product, uint32_t seq) {
            SWITCH_ACK_TIMEOUT_MS / 1000UL, SWITCH_ACK);
 }
 
-// Sends "switch <product>" as soon as a product name is known and the camera
-// is free, and times out the wait for "ok". Runs every scan.
+// Sends "switch <product>" once S1 has detected the part and its product name
+// is known, and times out the wait for "ok". Runs every scan.
 void serviceProgramSwitch(unsigned long now) {
+  dropStalePending(now);
   if (switchState == SW_WAITING && now - switchSentAt > SWITCH_ACK_TIMEOUT_MS) {
     switchState = SW_NO_ACK;
     publishWarning("SWITCH_NO_ACK", switchProduct, "no \"%s\" from the camera within %lu s after \"%s%s\"",
@@ -938,8 +944,11 @@ void serviceProgramSwitch(unsigned long now) {
     startProgramSwitch(cycleProduct, cycleSeq);
     return;
   }
-  // The next part's name: never switch while the camera inspects the part at S2.
-  if (pendingNeedsSwitch && state != ST_SWITCH_PROGRAM && state != ST_WAIT_RESULT) {
+  // Only for a part on the belt that has not been inspected yet (S1 seen, before
+  // SWITCH_PROGRAM): no switch with an empty belt (the job may still be cancelled
+  // before its part is put on it) and none while another part is at the camera.
+  bool partOnTheWay = (state == ST_RUN_TO_CAMERA || state == ST_SETTLE || state == ST_WAIT_PRODUCT);
+  if (pendingNeedsSwitch && partOnTheWay) {
     pendingNeedsSwitch = false;
     startProgramSwitch(pendingProduct, pendingSeq);
   }

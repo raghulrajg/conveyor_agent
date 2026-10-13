@@ -47,16 +47,17 @@ int main() {
   run(100);
   CHECK(state == ST_IDLE);
 
-  puts("\n=== 1. product name arrives before the part: switch sent at once, no wait at S2");
+  puts("\n=== 1. product name before the part: no switch on an empty belt, switch at S1, no wait at S2");
   mqttProduct("{\"request_id\": \"t-5#1\", \"subtask_id\": \"t-5\", \"product\": \"ABCD\", \"station\": \"quality_station\"}");
-  run(20);
+  run(2000);
   CHECK(strcmp(pendingProduct, "ABCD") == 0);
-  CHECK(state == ST_IDLE && camSwitchRequest && strcmp(camSwitchProduct, "ABCD") == 0);   // sent while idle
+  CHECK(state == ST_IDLE && !camSwitchRequest && switchState == SW_NONE);   // the job may still be cancelled
+  sensors(1, 0, 0); run(700); CHECK(state == ST_RUN_TO_CAMERA);
+  CHECK(camSwitchRequest && strcmp(camSwitchProduct, "ABCD") == 0);       // S1 seen: switch now
   CHECK(switchState == SW_WAITING);
   camSwitchRequest = false;
   camera("OK");                   // ack, case-insensitive
-  run(20); CHECK(switchState == SW_OK); CHECK(state == ST_IDLE);
-  sensors(1, 0, 0); run(700); CHECK(state == ST_RUN_TO_CAMERA);
+  run(20); CHECK(switchState == SW_OK); CHECK(state == ST_RUN_TO_CAMERA);
   sensors(0, 1, 0); run(500);     // debounce + settle 400 ms
   CHECK(state == ST_WAIT_RESULT); // program already loaded: straight on
   CHECK(!camSwitchRequest);       // no second switch
@@ -84,13 +85,14 @@ int main() {
   partToExitAndAway();
 
   puts("\n=== 3. no ok within 10 s of sending (before S2) -> warning, part does not wait at S2");
-  mqttProduct("P3"); run(20); CHECK(camSwitchRequest); camSwitchRequest = false;
-  run(10100);
+  mqttProduct("P3"); run(20); CHECK(!camSwitchRequest);
+  sensors(1, 0, 0); run(700); CHECK(state == ST_RUN_TO_CAMERA); CHECK(camSwitchRequest); camSwitchRequest = false;
+  run(10100); CHECK(state == ST_RUN_TO_CAMERA);   // slow belt: still on the way
   CHECK(switchState == SW_NO_ACK); CHECK(warnings & W_SWITCH_NO_ACK);
   m = drainMqtt();
   CHECK(has(m, MQ_WARNING, "\"warning\":\"SWITCH_NO_ACK\"") && has(m, MQ_WARNING, "\"product\":\"P3\""));
   for (auto& e : m) printf("MQTT[%d] %s\n", e.first, e.second.c_str());
-  partToCamera();
+  sensors(0, 1, 0); run(500);
   CHECK(state == ST_WAIT_RESULT);
   camera("ok"); run(50); CHECK(state == ST_WAIT_RESULT);   // late ack: not a result
   camera("1;2;3;NG;"); run(20); CHECK(state == ST_RUN_TO_EXIT);
@@ -109,19 +111,21 @@ int main() {
   cmd("SIM 1;2;3;OK;"); run(20); CHECK(state == ST_RUN_TO_EXIT);
   partToExitAndAway(); drainMqtt();
 
-  puts("\n=== 5. next part's name during this part's inspection: switch waits for the result");
-  mqttProduct("P5a"); run(20); ackSwitch();
-  partToCamera(); CHECK(state == ST_WAIT_RESULT);
+  puts("\n=== 5. next part's name during this part's inspection: switch waits for the next S1");
+  mqttProduct("P5a"); run(20);
+  sensors(1, 0, 0); run(700); ackSwitch();
+  sensors(0, 1, 0); run(500); CHECK(state == ST_WAIT_RESULT);
   mqttProduct("P5b"); run(50);
   CHECK(!camSwitchRequest);       // camera busy with P5a
   CHECK(strcmp(pendingProduct, "P5b") == 0);
   camera("1;2;3;OK;"); run(20); CHECK(state == ST_RUN_TO_EXIT);
-  CHECK(camSwitchRequest && strcmp(camSwitchProduct, "P5b") == 0);   // right after the result
+  CHECK(!camSwitchRequest);       // P5b's part is not on the belt yet
   m = drainMqtt(); CHECK(has(m, MQ_RESULT, "\"product\":\"P5a\",\"switch_ok\":true"));
-  camSwitchRequest = false; camera("ok"); run(20);
   partToExitAndAway();
-  CHECK(strcmp(pendingProduct, "P5b") == 0);   // kept for the next part
-  partToCamera(); CHECK(state == ST_WAIT_RESULT);
+  CHECK(!camSwitchRequest && strcmp(pendingProduct, "P5b") == 0);   // kept for the next part
+  sensors(1, 0, 0); run(700); CHECK(camSwitchRequest && strcmp(camSwitchProduct, "P5b") == 0);
+  ackSwitch();
+  sensors(0, 1, 0); run(500); CHECK(state == ST_WAIT_RESULT);
   cmd("SIM 1;2;3;OK;"); run(20);
   m = drainMqtt(); CHECK(has(m, MQ_RESULT, "\"product\":\"P5b\",\"switch_ok\":true"));
   partToExitAndAway();
@@ -145,12 +149,14 @@ int main() {
   CHECK(!camSwitchRequest);
   m = drainMqtt(); CHECK(has(m, MQ_WARNING, "PRODUCT_REJECTED"));
 
-  puts("\n=== 8. stale product is not used; STOP keeps the name and its confirmed switch");
-  mqttProduct("OLD1"); run(20); ackSwitch();
+  puts("\n=== 8. name of a cancelled job (no part) goes stale, never switched; STOP keeps the name");
+  mqttProduct("OLD1"); run(20);
   run(121000);
-  partToCamera();
-  CHECK(state == ST_WAIT_PRODUCT); CHECK(pendingProduct[0] == 0);
+  CHECK(pendingProduct[0] == 0);
   m = drainMqtt(); CHECK(has(m, MQ_WARNING, "PRODUCT_STALE"));
+  CHECK(!camSwitchRequest && switchState != SW_WAITING);
+  partToCamera();
+  CHECK(state == ST_WAIT_PRODUCT); CHECK(!camSwitchRequest);
   mqttProduct("NEW1"); run(50); CHECK(state == ST_SWITCH_PROGRAM);
   ackSwitch(); CHECK(state == ST_WAIT_RESULT);
   cmd("STOP"); run(20); CHECK(state == ST_STOPPED);

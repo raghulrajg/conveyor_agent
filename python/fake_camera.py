@@ -20,6 +20,11 @@ Python 3.8+, standard library only.
     python fake_camera.py --mode server --interval 1       # continuous camera, 1 result/s
     python fake_camera.py --mode server --auto --delay 0.5 # answer every trigger from the Opta
     python fake_camera.py --mode server --ng-rate 0.3      # 30 % of random results are NG
+    python fake_camera.py --mode server --no-switch-ack    # never answer "switch <product>" (tests the warning)
+
+  Program switch: the Opta sends "switch <product>" before each inspection.
+  The fake camera answers "ok" (like the real camera after loading that
+  product's program) unless --no-switch-ack or "switchack off" is used.
 
   Console commands
     <Enter> or s                send one random OK result
@@ -27,6 +32,7 @@ Python 3.8+, standard library only.
     xyz <x> <y> <theta> [res]   send these values, e.g.  xyz 12.5 30.2 45 OK
     raw <text>                  send text exactly as typed, e.g.  raw garbage
     auto on|off                 answer every trigger string received from the Opta
+    switchack on|off            answer "ok" to "switch <product>" from the Opta
     interval <s>|off            send a result every <s> seconds (continuous mode)
     kick                        close the connection (tests reconnect on both sides)
     status                      connection info
@@ -57,6 +63,8 @@ class FakeCamera:
         self.peer = None
         self.lock = threading.Lock()
         self.auto = args.auto
+        self.switch_ack = not args.no_switch_ack
+        self.program = None
         self.interval = args.interval if args.interval and args.interval > 0 else None
         self.sent = 0
         self.running = True
@@ -149,6 +157,16 @@ class FakeCamera:
                         self._drop_locked()
                         log("CAM", "connection closed")
                 return
+            text = data.decode("ascii", "replace").strip()
+            if text.lower().startswith("switch"):
+                product = text[6:].strip()
+                log("RX ", f"from Opta: {data!r}  (program switch to {product!r})")
+                if self.switch_ack:
+                    self.program = product
+                    threading.Timer(self.args.switch_delay, self.send, args=("ok", "switch ack")).start()
+                else:
+                    log("CAM", "switch ack is OFF - not answering (the Opta warns after 10 s)")
+                continue
             log("RX ", f"from Opta: {data!r}  (trigger?)")
             if self.auto:
                 threading.Timer(self.args.delay, self.send, args=(self.make_result(), "auto reply")).start()
@@ -208,6 +226,9 @@ class FakeCamera:
                 elif cmd == "auto":
                     self.auto = arg.lower() in ("on", "1", "yes", "true")
                     log("CFG", f"auto reply: {'ON' if self.auto else 'OFF'}")
+                elif cmd == "switchack":
+                    self.switch_ack = arg.lower() in ("on", "1", "yes", "true")
+                    log("CFG", f"switch ack: {'ON' if self.switch_ack else 'OFF'}")
                 elif cmd == "interval":
                     try:
                         self.interval = None if arg.lower() in ("", "off", "0") else float(arg)
@@ -220,7 +241,8 @@ class FakeCamera:
                     log("CAM", "connection closed by command")
                 elif cmd == "status":
                     log("CFG", f"mode={self.args.mode} connected={self.peer[0] if self.peer else 'no'} "
-                               f"sent={self.sent} auto={self.auto} interval={self.interval or 'off'}")
+                               f"sent={self.sent} auto={self.auto} interval={self.interval or 'off'} "
+                               f"switch_ack={self.switch_ack} program={self.program or '-'}")
                 elif cmd in ("help", "?", "h"):
                     print(__doc__.split("Console commands")[1])
                 elif cmd in ("quit", "exit", "q"):
@@ -256,6 +278,8 @@ def main():
     p.add_argument("--auto", action="store_true", help="answer every trigger received from the Opta")
     p.add_argument("--delay", type=float, default=0.5, help="auto-reply delay in seconds")
     p.add_argument("--interval", type=float, default=0, help="send a result every N seconds")
+    p.add_argument("--no-switch-ack", action="store_true", help='do not answer "switch <product>" with "ok"')
+    p.add_argument("--switch-delay", type=float, default=0.3, help='delay before the "ok" to a program switch')
     sys.exit(FakeCamera(p.parse_args()).run())
 
 

@@ -18,8 +18,11 @@
    Sequence (one product at a time)
      IDLE            S1 detects object AND S3 is clear .......... motor ON
      RUN_TO_CAMERA   S2 detects object .......................... motor OFF
-     SETTLE          wait for the belt to stop, optionally trigger camera
-     WAIT_RESULT     wait for the camera result (x;y;theta;result)
+     SETTLE          wait for the belt to stop
+     WAIT_PRODUCT    wait for this part's product name (MQTT, every cycle)
+     SWITCH_PROGRAM  send "switch <product>" to the camera, wait for "ok"
+                     (no "ok" within 10 s -> warning, the cycle continues)
+     WAIT_RESULT     optionally trigger camera, wait for the camera result
      -> result       published to MQTT; S3 clear ................ motor ON
                      S3 occupied -> WAIT_EXIT_CLEAR (waits, warning shown)
      RUN_TO_EXIT     S3 detects object .......................... motor OFF
@@ -94,7 +97,8 @@
 
    USB Serial commands (Arduino IDE Serial Monitor, 115200, any line ending)
      HELP, PING, STATUS, RESET, START, STOP, SIM <text>, TRIG, RECONNECT,
-     CLEAR, VERSION     e.g.  SIM 12.5;30.2;45.0;OK;   (test without camera)
+     PRODUCT <name>, CLEAR, VERSION
+                        e.g.  SIM 12.5;30.2;45.0;OK;   (test without camera)
 
    MQTT (result publishing)
      Every camera result is published as JSON to MQTT_TOPIC, e.g.
@@ -110,6 +114,18 @@
      and sent when the connection is back.
      Library: install "ArduinoMqttClient" (Arduino) from the Library Manager.
 
+   Multiple products (camera program switch)
+     Each product has its own program on the camera. Every cycle needs the
+     product name of the part on the belt, received on MQTT_PRODUCT_TOPIC:
+       {"product":"ABCD", ...}  (the scheduler's qc/qc_01/request)  or plain  ABCD
+     When the part has settled at S2 the Opta sends  switch ABCD  to the
+     camera over the camera TCP link and waits SWITCH_ACK_TIMEOUT_MS (10 s)
+     for "ok". Without "ok" a warning is shown (OUTPUT 2 blinking) and
+     published on MQTT_WARNING_TOPIC, and the cycle continues; the result
+     carries "switch_ok":false. No product name within
+     PRODUCT_WAIT_TIMEOUT_MS -> FAULT NO_PRODUCT. A product name is used
+     for ONE cycle only. Serial command  PRODUCT ABCD  sets it by hand.
+
    Board package: "Arduino Mbed OS Opta Boards", board "Arduino Opta",
    target core "Main Core" (M7).
   ============================================================================
@@ -124,7 +140,7 @@
 #include <ctype.h>
 #include <string.h>
 
-#define FW_VERSION "OPTA-CONVEYOR 3.0"
+#define FW_VERSION "OPTA-CONVEYOR 3.1"
 
 // ============================ CONFIGURATION =================================
 // ---- Network ----
@@ -149,18 +165,22 @@ const bool USE_MQTT          = true;
 const bool MQTT_USE_ETHERNET = false;        // false = WiFi (default), true = Ethernet
 const char* const WIFI_SSID     = "DESKTOP-HKOM52L 2139"; 
 const char* const WIFI_PASSWORD = "123456789";
-IPAddress MQTT_BROKER_IP(172, 16, 13, 62);   // MQTT_BROKER_HOST
+IPAddress MQTT_BROKER_IP(172, 25, 200, 57);  // = MQTT_BROKER_HOST in the Task-Scheduler-Agent .env
 const uint16_t MQTT_BROKER_PORT = 1883;
 const char* const MQTT_USERNAME  = "raghulrajg";
 const char* const MQTT_PASSWORD  = "Gr2_nemam";
 const char* const MQTT_CLIENT_ID = "opta-conveyor";
 const char* const MQTT_TOPIC     = "autonomous/product/Transformation";
+// Product name for the next cycle. The scheduler's QC agent publishes
+// {"request_id":..., "product":"ABCD", ...} here for every part; plain text "ABCD" works too.
+const char* const MQTT_PRODUCT_TOPIC = "qc/qc_01/request";
+const char* const MQTT_WARNING_TOPIC = "autonomous/product/Warning";
 const bool MQTT_RETAIN = false;
 const uint8_t MQTT_QOS = 0;
 const unsigned long MQTT_RETRY_MS = 5000;     // WiFi / broker reconnect period
 const unsigned long MQTT_KEEPALIVE_MS = 15000;
 const uint8_t MQTT_QUEUE_SIZE = 16;
-const size_t MQTT_PAYLOAD_MAX = 256;
+const size_t MQTT_PAYLOAD_MAX = 320;
 
 // ---- Inputs ----
 const uint8_t PIN_S1_ENTRY  = A0;     // I1
@@ -190,6 +210,14 @@ const TriggerMode CAMERA_TRIGGER_MODE = TRIGGER_NONE;
 const char* const CAMERA_TRIGGER_STRING = "start"; // = SCMVS "Communication String"
 const bool TRIGGER_APPEND_CRLF = false;            // true if the camera expects CR/LF
 
+// ---- Product / camera program switch ----
+// true = every cycle needs a product name (MQTT_PRODUCT_TOPIC or PRODUCT command)
+const bool REQUIRE_PRODUCT = true;
+const char* const SWITCH_COMMAND_PREFIX = "switch ";   // sent as "switch ABCD"
+const bool SWITCH_APPEND_CRLF = false;                 // true if the camera expects CR/LF
+const char* const SWITCH_ACK = "ok";                   // camera reply (case-insensitive)
+const size_t PRODUCT_MAX = 65;                         // product name max 64 chars: A-Z a-z 0-9 space _ - .
+
 // ---- Camera result ----
 // Message format: x;y;theta;result;   (',' also accepted)
 // A camera message is complete after this many ';' or ',' (x;y;theta;result; = 4). 0 = off.
@@ -207,6 +235,9 @@ const unsigned long START_DELAY_MS              = 500;   // S1 stable before mot
 const unsigned long SETTLE_MS                   = 400;   // after stop at S2, before trigger
 const unsigned long TRAVEL_TO_CAMERA_TIMEOUT_MS = 15000; // S1 -> S2 max travel time
 const unsigned long RESULT_TIMEOUT_MS           = 10000; // max wait for camera result
+const unsigned long PRODUCT_WAIT_TIMEOUT_MS     = 30000; // part at S2, no product name -> FAULT
+const unsigned long SWITCH_ACK_TIMEOUT_MS       = 10000; // wait for "ok" after "switch <product>"
+const unsigned long PRODUCT_MAX_AGE_MS          = 120000; // older product names are discarded
 const unsigned long TRAVEL_TO_EXIT_TIMEOUT_MS   = 15000; // S2 -> S3 max travel time
 const unsigned long EXIT_BLOCKED_WARN_MS        = 2000;  // warn if exit stays occupied
 const unsigned long EXIT_CLEAR_DELAY_MS         = 500;   // S3 must be clear this long before restart
@@ -229,21 +260,21 @@ const uint32_t      WATCHDOG_MS                 = 8000;
 
 // ------------------------------ Types ---------------------------------------
 enum State : uint8_t {
-  ST_IDLE, ST_RUN_TO_CAMERA, ST_SETTLE, ST_WAIT_RESULT, ST_WAIT_EXIT_CLEAR,
-  ST_RUN_TO_EXIT, ST_AT_EXIT, ST_STOPPED, ST_FAULT
+  ST_IDLE, ST_RUN_TO_CAMERA, ST_SETTLE, ST_WAIT_PRODUCT, ST_SWITCH_PROGRAM, ST_WAIT_RESULT,
+  ST_WAIT_EXIT_CLEAR, ST_RUN_TO_EXIT, ST_AT_EXIT, ST_STOPPED, ST_FAULT
 };
 const char* const STATE_NAMES[] = {
-  "IDLE", "RUN_TO_CAMERA", "SETTLE", "WAIT_RESULT", "WAIT_EXIT_CLEAR",
-  "RUN_TO_EXIT", "AT_EXIT", "STOPPED", "FAULT"
+  "IDLE", "RUN_TO_CAMERA", "SETTLE", "WAIT_PRODUCT", "SWITCH_PROGRAM", "WAIT_RESULT",
+  "WAIT_EXIT_CLEAR", "RUN_TO_EXIT", "AT_EXIT", "STOPPED", "FAULT"
 };
 
 enum Fault : uint8_t {
   F_NONE, F_S2_TIMEOUT, F_RESULT_TIMEOUT, F_S3_TIMEOUT, F_S3_UNEXPECTED,
-  F_ESTOP, F_DRIVE
+  F_ESTOP, F_DRIVE, F_NO_PRODUCT
 };
 const char* const FAULT_NAMES[] = {
   "NONE", "S2_TIMEOUT", "RESULT_TIMEOUT", "S3_TIMEOUT", "S3_UNEXPECTED",
-  "ESTOP", "DRIVE_FAULT"
+  "ESTOP", "DRIVE_FAULT", "NO_PRODUCT"
 };
 
 enum ResultClass : uint8_t { RES_NONE, RES_OK, RES_NG, RES_OTHER };
@@ -253,6 +284,7 @@ const char* const RESULT_NAMES[] = { "NONE", "OK", "NG", "OTHER" };
 const uint8_t W_EXIT_BLOCKED   = 0x01;
 const uint8_t W_CAMERA_OFFLINE = 0x02;
 const uint8_t W_ETH_LINK_DOWN  = 0x04;
+const uint8_t W_SWITCH_NO_ACK  = 0x08;   // camera did not answer "ok" to "switch <product>" this cycle
 
 const size_t LINE_MAX = 128;
 
@@ -279,7 +311,10 @@ struct LineRx {
 };
 
 // Messages from the camera thread to loop()
-enum NetMsgType : uint8_t { NM_DATA, NM_INFO, NM_MQTT };
+enum NetMsgType : uint8_t { NM_DATA, NM_INFO, NM_MQTT, NM_PRODUCT };
+// MQTT send queue: which topic an entry goes to
+const uint8_t MQ_RESULT = 0;    // MQTT_TOPIC
+const uint8_t MQ_WARNING = 1;   // MQTT_WARNING_TOPIC
 const size_t NETMSG_MAX = 340;
 struct NetMsg {
   NetMsgType type;
@@ -304,6 +339,11 @@ void updateWarnings(unsigned long now);
 void updateIndication(unsigned long now);
 void fireCameraTrigger(const char* source);
 void acceptResult(const char* msg, const char* source, unsigned long receivedAt);
+void handleCameraData(const char* msg, const char* source, unsigned long receivedAt);
+bool handleProductMessage(const char* payload, const char* source);
+bool takePendingProduct(unsigned long now);
+void requestProgramSwitch();
+void publishWarning(const char* code, const char* fmt, ...);
 struct CamResult {
   bool valid;          // x, y, theta are numbers and a result field is present
   float x, y, theta;
@@ -331,7 +371,7 @@ void cameraTask();
 void netPost(NetMsgType type, unsigned long t, const char* fmt, ...);
 // MQTT thread
 void mqttTask();
-void mqttEnqueue(const char* payload);
+void mqttEnqueue(uint8_t topic, const char* payload);
 void publishResult(const CamResult& r, bool isNg, const char* raw);
 bool netPop(NetMsg& out);
 
@@ -356,6 +396,15 @@ char lastCamResult[16] = "-";
 char lastResultText[48] = "-";
 uint32_t cntCycles = 0, cntOk = 0, cntNg = 0, cntFaults = 0;
 
+// ---- product of the part on the belt (one name per cycle) ----
+char pendingProduct[PRODUCT_MAX] = "";      // received, not yet used by a cycle
+unsigned long pendingProductAt = 0;
+char cycleProduct[PRODUCT_MAX] = "";        // the current cycle's product ("" = none)
+bool switchSent = false;                    // "switch <product>" requested this cycle
+bool switchOk = false;                      // camera answered "ok"
+bool switchWarn = false;                    // no "ok" this cycle (warning indication)
+unsigned long switchSentAt = 0;
+
 // ---- shared between loop() and the camera thread ----
 rtos::Thread cameraThread(osPriorityNormal, 8192, nullptr, "camera");
 rtos::Mutex netMutex;                       // protects netQ
@@ -364,11 +413,14 @@ uint8_t netQHead = 0, netQCount = 0;
 volatile bool camConnected = false;
 volatile bool camTriggerRequest = false;
 volatile bool camReconnectRequest = false;
+volatile bool camSwitchRequest = false;
+char camSwitchProduct[PRODUCT_MAX] = "";    // written under netMutex before camSwitchRequest is set
 
 // ---- shared between loop() and the MQTT thread ----
 rtos::Thread mqttThread(osPriorityNormal, 8192, nullptr, "mqtt");
 rtos::Mutex mqttMutex;                      // protects mqttQ
 char mqttQ[MQTT_QUEUE_SIZE][MQTT_PAYLOAD_MAX];
+uint8_t mqttQTopic[MQTT_QUEUE_SIZE];        // MQ_RESULT / MQ_WARNING
 uint8_t mqttQHead = 0, mqttQCount = 0;
 uint32_t mqttPublished = 0, mqttDropped = 0;
 volatile bool mqttConnected = false;
@@ -419,9 +471,24 @@ void enterState(State s, const char* reason) {
   stateSince = millis();
   logEvent("STATE", "%s->%s %s", STATE_NAMES[old], STATE_NAMES[s], reason);
 
+  if (old == ST_IDLE && s != ST_STOPPED && s != ST_FAULT) {
+    // a new cycle: it needs its own product name
+    cycleProduct[0] = '\0';
+    switchSent = switchOk = switchWarn = false;
+  }
+
   switch (s) {
+    case ST_IDLE:
+      cycleProduct[0] = '\0';              // a product name is used for one cycle only
+      switchWarn = false;
+      break;
     case ST_RUN_TO_CAMERA:
       ngLamp = false;                       // new product, clear old NG lamp
+      break;
+    case ST_SWITCH_PROGRAM:
+      switchSent = switchOk = false;
+      if (cameraConnected()) requestProgramSwitch();
+      else logEvent("WARN", "camera not connected - \"switch %s\" is sent when it connects", cycleProduct);
       break;
     case ST_WAIT_RESULT: {
       // Only camera data that starts arriving from now on is accepted (see acceptResult).
@@ -446,6 +513,22 @@ void raiseFault(Fault f, const char* detail) {
   enterState(ST_FAULT, FAULT_NAMES[f]);
 }
 
+// RESET / restart starts a new cycle. After a STOP the part is still on the
+// belt: it keeps its product name. After a FAULT the belt is cleared by hand,
+// so only a part still at the camera keeps it; other product names are dropped.
+static void keepProductForRestart(bool afterFault) {
+  bool keep = !afterFault || s2.state;
+  if (keep && cycleProduct[0] && !pendingProduct[0]) {
+    strcpy(pendingProduct, cycleProduct);
+    pendingProductAt = millis();
+    logEvent("PRODUCT", "\"%s\" kept for the part on the belt", pendingProduct);
+  } else if (!keep && pendingProduct[0]) {
+    logEvent("PRODUCT", "\"%s\" discarded by the reset", pendingProduct);
+    pendingProduct[0] = '\0';
+  }
+  cycleProduct[0] = '\0';
+}
+
 void requestReset(const char* source, Print& out) {
   if (state == ST_FAULT) {
     if (USE_ESTOP_INPUT && !estopIn.state) { out.println("ERR reset refused: E-stop still active"); return; }
@@ -453,10 +536,12 @@ void requestReset(const char* source, Print& out) {
     logEvent("RESET", "fault %s cleared by %s", FAULT_NAMES[fault], source);
     if (fault == F_RESULT_TIMEOUT) camReconnectRequest = true;   // start with a fresh camera link
     fault = F_NONE;
+    keepProductForRestart(true);
     enterState(ST_IDLE, "reset");
     out.println("OK reset");
   } else if (state == ST_STOPPED) {
     logEvent("RESET", "restart by %s", source);
+    keepProductForRestart(false);
     enterState(ST_IDLE, "restart");
     out.println("OK restarted");
   } else {
@@ -489,7 +574,35 @@ void runStateMachine(unsigned long now) {
       break;
 
     case ST_SETTLE:
-      if (inState >= SETTLE_MS) enterState(ST_WAIT_RESULT, "settled");
+      if (inState < SETTLE_MS) break;
+      if (REQUIRE_PRODUCT || pendingProduct[0]) enterState(ST_WAIT_PRODUCT, "settled");
+      else enterState(ST_WAIT_RESULT, "settled");
+      break;
+
+    case ST_WAIT_PRODUCT:
+      if (takePendingProduct(now)) {
+        char reason[PRODUCT_MAX + 16];
+        snprintf(reason, sizeof(reason), "product %s", cycleProduct);
+        enterState(ST_SWITCH_PROGRAM, reason);
+        break;
+      }
+      if (inState > PRODUCT_WAIT_TIMEOUT_MS) {
+        publishWarning("NO_PRODUCT", "no product name within %lu s (topic %s)",
+                       PRODUCT_WAIT_TIMEOUT_MS / 1000UL, MQTT_PRODUCT_TOPIC);
+        raiseFault(F_NO_PRODUCT, "no product name received for the part at the camera");
+      }
+      break;
+
+    case ST_SWITCH_PROGRAM:
+      // "ok" from the camera arrives through handleCameraData().
+      if (!switchSent && cameraConnected()) requestProgramSwitch();
+      if (inState > SWITCH_ACK_TIMEOUT_MS) {
+        switchWarn = true;
+        publishWarning("SWITCH_NO_ACK", "no \"%s\" from the camera within %lu s after \"%s%s\"%s",
+                       SWITCH_ACK, SWITCH_ACK_TIMEOUT_MS / 1000UL, SWITCH_COMMAND_PREFIX, cycleProduct,
+                       switchSent ? "" : " (camera not connected, not sent)");
+        enterState(ST_WAIT_RESULT, "no switch ack - continuing");
+      }
       break;
 
     case ST_WAIT_RESULT:
@@ -547,6 +660,7 @@ void updateWarnings(unsigned long now) {
   if (state == ST_WAIT_EXIT_CLEAR && (now - stateSince) >= EXIT_BLOCKED_WARN_MS) w |= W_EXIT_BLOCKED;
   if (!cameraConnected() && now > CAMERA_BOOT_GRACE_MS) w |= W_CAMERA_OFFLINE;
   if (!linkUp) w |= W_ETH_LINK_DOWN;
+  if (switchWarn) w |= W_SWITCH_NO_ACK;
 
   if (w != warnings) {
     char txt[64];
@@ -673,6 +787,121 @@ void fmtFixed(char* out, size_t size, float v) {
   const char* sign = (scaled < 0) ? "-" : "";
   if (scaled < 0) scaled = -scaled;
   snprintf(out, size, "%s%ld.%03ld", sign, scaled / 1000L, scaled % 1000L);
+}
+
+// ============================ Product / program switch ======================
+static bool equalsIgnoreCase(const char* a, const char* b) {
+  while (*a && *b && toupper((unsigned char)*a) == toupper((unsigned char)*b)) { a++; b++; }
+  return *a == '\0' && *b == '\0';
+}
+
+static void trimCopy(char* out, size_t size, const char* in, size_t len) {
+  while (len > 0 && isspace((unsigned char)*in)) { in++; len--; }
+  while (len > 0 && isspace((unsigned char)in[len - 1])) len--;
+  if (len > size - 1) len = size - 1;
+  memcpy(out, in, len);
+  out[len] = '\0';
+}
+
+static bool isSwitchAck(const char* msg) {
+  char t[16];
+  size_t n = strlen(msg);
+  if (n >= sizeof(t) + 8) return false;
+  trimCopy(t, sizeof(t), msg, n);
+  return equalsIgnoreCase(t, SWITCH_ACK);
+}
+
+// Letters, digits, space, '_', '-', '.' only (the scheduler's rule), max 64 chars.
+static bool validProductName(const char* p) {
+  size_t n = strlen(p);
+  if (n == 0 || n > PRODUCT_MAX - 1) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = p[i];
+    if (!(isalnum((unsigned char)c) || c == ' ' || c == '_' || c == '-' || c == '.')) return false;
+  }
+  return true;
+}
+
+// Product name from {"product":"ABCD",...} or a plain-text payload. False if none.
+static bool extractProduct(const char* payload, char* out, size_t size) {
+  out[0] = '\0';
+  const char* p = payload;
+  while (isspace((unsigned char)*p)) p++;
+  if (*p != '{') {
+    trimCopy(out, size, p, strlen(p));
+    return out[0] != '\0';
+  }
+  const char* k = strstr(p, "\"product\"");
+  if (!k) return false;
+  k += 9;
+  while (isspace((unsigned char)*k)) k++;
+  if (*k++ != ':') return false;
+  while (isspace((unsigned char)*k)) k++;
+  if (*k++ != '"') return false;                           // null or not a string
+  const char* e = strchr(k, '"');
+  if (!e) return false;
+  trimCopy(out, size, k, (size_t)(e - k));
+  return out[0] != '\0';
+}
+
+bool handleProductMessage(const char* payload, const char* source) {
+  char name[PRODUCT_MAX + 8];
+  if (!extractProduct(payload, name, sizeof(name)) || !validProductName(name)) {
+    publishWarning("PRODUCT_REJECTED", "bad product name from %s (A-Z a-z 0-9 space _ - . max 64): %.80s",
+                   source, payload);
+    return false;
+  }
+  if (pendingProduct[0] && strcmp(pendingProduct, name) != 0) {
+    logEvent("PRODUCT", "\"%s\" replaces the unused \"%s\"", name, pendingProduct);
+  }
+  strcpy(pendingProduct, name);
+  pendingProductAt = millis();
+  logEvent("PRODUCT", "\"%s\" received from %s (state %s)", pendingProduct, source, STATE_NAMES[state]);
+  return true;
+}
+
+// Moves the pending product name into this cycle. False if there is none (or it is too old).
+bool takePendingProduct(unsigned long now) {
+  if (!pendingProduct[0]) return false;
+  if (now - pendingProductAt > PRODUCT_MAX_AGE_MS) {
+    publishWarning("PRODUCT_STALE", "product \"%s\" discarded: received %lu s ago, before this part",
+                   pendingProduct, (now - pendingProductAt) / 1000UL);
+    pendingProduct[0] = '\0';
+    return false;
+  }
+  strcpy(cycleProduct, pendingProduct);
+  pendingProduct[0] = '\0';
+  return true;
+}
+
+void requestProgramSwitch() {
+  netMutex.lock();
+  strcpy(camSwitchProduct, cycleProduct);
+  netMutex.unlock();
+  switchSent = true;
+  switchSentAt = millis();
+  camSwitchRequest = true;                   // the camera thread sends it
+  logEvent("SWITCH", "\"%s%s\" requested, waiting %lu s for \"%s\"", SWITCH_COMMAND_PREFIX, cycleProduct,
+           SWITCH_ACK_TIMEOUT_MS / 1000UL, SWITCH_ACK);
+}
+
+// Every message from the camera: the "ok" of a program switch, or an inspection result.
+void handleCameraData(const char* msg, const char* source, unsigned long receivedAt) {
+  if (isSwitchAck(msg)) {
+    if (state == ST_SWITCH_PROGRAM && switchSent && (long)(receivedAt - switchSentAt) >= 0) {
+      switchOk = true;
+      logEvent("SWITCH", "camera program \"%s\" active (%lu ms)", cycleProduct, millis() - switchSentAt);
+      enterState(ST_WAIT_RESULT, "switch ok");
+    } else {
+      logEvent("IGNORED", "\"%s\" from %s in state %s (no switch pending)", msg, source, STATE_NAMES[state]);
+    }
+    return;
+  }
+  if (state == ST_SWITCH_PROGRAM) {
+    logEvent("IGNORED", "\"%s\" from %s while waiting for \"%s\"", msg, source, SWITCH_ACK);
+    return;
+  }
+  acceptResult(msg, source, receivedAt);
 }
 
 void acceptResult(const char* msg, const char* source, unsigned long receivedAt) {
@@ -923,6 +1152,20 @@ void cameraTask() {
       else { closeCameraSocket(sock, "trigger send failed"); continue; }
     }
 
+    // ---------------- send program switch ----------------
+    if (camSwitchRequest) {
+      char t[PRODUCT_MAX + 32];
+      netMutex.lock();
+      camSwitchRequest = false;
+      int n = snprintf(t, sizeof(t), "%s%s%s", SWITCH_COMMAND_PREFIX, camSwitchProduct, SWITCH_APPEND_CRLF ? "\r\n" : "");
+      netMutex.unlock();
+      sock->set_timeout(SOCKET_SEND_TIMEOUT_MS);
+      nsapi_size_or_error_t r = sock->send(t, (nsapi_size_t)n);
+      sock->set_timeout(SOCKET_POLL_MS);
+      if (r == n) netPost(NM_INFO, millis(), "sent \"%s%s\"", SWITCH_COMMAND_PREFIX, camSwitchProduct);
+      else { closeCameraSocket(sock, "switch send failed"); continue; }
+    }
+
     // ---------------- receive ----------------
     nsapi_size_or_error_t n = sock->recv(buf, sizeof(buf));  // waits max SOCKET_POLL_MS
     unsigned long now = millis();
@@ -950,7 +1193,8 @@ bool cameraConnected() {
 void serviceCamera(unsigned long now) {
   NetMsg m;
   for (int i = 0; i < NETQ_SIZE && netPop(m); i++) {
-    if (m.type == NM_DATA) acceptResult(m.text, "camera", m.t);
+    if (m.type == NM_DATA) handleCameraData(m.text, "camera", m.t);
+    else if (m.type == NM_PRODUCT) handleProductMessage(m.text, "mqtt");
     else logEvent(m.type == NM_MQTT ? "MQTT" : "CAMERA", "%s", m.text);
   }
 }
@@ -958,7 +1202,7 @@ void serviceCamera(unsigned long now) {
 // ============================== MQTT thread =================================
 // loop() only puts JSON payloads into mqttQ. This thread owns WiFi and the MQTT
 // client, so a slow WiFi join or an unreachable broker never delays the conveyor.
-void mqttEnqueue(const char* payload) {
+void mqttEnqueue(uint8_t topic, const char* payload) {
   if (!USE_MQTT) return;
   mqttMutex.lock();
   if (mqttQCount == MQTT_QUEUE_SIZE) {                     // full: drop the oldest
@@ -969,15 +1213,16 @@ void mqttEnqueue(const char* payload) {
   uint8_t idx = (mqttQHead + mqttQCount) % MQTT_QUEUE_SIZE;
   strncpy(mqttQ[idx], payload, MQTT_PAYLOAD_MAX - 1);
   mqttQ[idx][MQTT_PAYLOAD_MAX - 1] = '\0';
+  mqttQTopic[idx] = topic;
   mqttQCount++;
   mqttMutex.unlock();
 }
 
 // Copies the oldest payload without removing it (removed only after a good publish).
-static bool mqttPeek(char* out) {
+static bool mqttPeek(char* out, uint8_t& topic) {
   mqttMutex.lock();
   bool any = mqttQCount > 0;
-  if (any) strcpy(out, mqttQ[mqttQHead]);
+  if (any) { strcpy(out, mqttQ[mqttQHead]); topic = mqttQTopic[mqttQHead]; }
   mqttMutex.unlock();
   return any;
 }
@@ -988,25 +1233,78 @@ static void mqttPopFront() {
   mqttMutex.unlock();
 }
 
+// Copies text without JSON-breaking characters (" and \ become ').
+static void jsonSafe(char* out, size_t size, const char* in) {
+  size_t k = 0;
+  for (size_t i = 0; in[i] && k < size - 1; i++) {
+    char c = in[i];
+    out[k++] = (c == '"' || c == '\\') ? '\'' : ((unsigned char)c < 0x20 ? ' ' : c);
+  }
+  out[k] = '\0';
+}
+
+// "product":"ABCD","switch_ok":true   (null, null when the cycle had no product name)
+static void productFields(char* out, size_t size) {
+  if (cycleProduct[0]) snprintf(out, size, "\"product\":\"%s\",\"switch_ok\":%s", cycleProduct, switchOk ? "true" : "false");
+  else snprintf(out, size, "\"product\":null,\"switch_ok\":null");
+}
+
 void publishResult(const CamResult& r, bool isNg, const char* raw) {
   char safe[64];                                           // raw text without JSON-breaking chars
-  size_t k = 0;
-  for (size_t i = 0; raw[i] && k < sizeof(safe) - 1; i++) safe[k++] = (raw[i] == '"' || raw[i] == '\\') ? '\'' : raw[i];
-  safe[k] = '\0';
+  jsonSafe(safe, sizeof(safe), raw);
+  char prod[PRODUCT_MAX + 40];
+  productFields(prod, sizeof(prod));
   char payload[MQTT_PAYLOAD_MAX];
   if (r.valid) {
     char xs[16], ys[16], ts[16];
     fmtFixed(xs, sizeof(xs), r.x); fmtFixed(ys, sizeof(ys), r.y); fmtFixed(ts, sizeof(ts), r.theta);
     snprintf(payload, sizeof(payload),
-             "{\"x\":%s,\"y\":%s,\"theta\":%s,\"result\":\"%s\",\"valid\":true,\"cycle\":%lu,\"raw\":\"%s\"}",
-             xs, ys, ts, isNg ? "NG" : "OK", (unsigned long)(cntCycles + 1), safe);
+             "{\"x\":%s,\"y\":%s,\"theta\":%s,\"result\":\"%s\",\"valid\":true,\"cycle\":%lu,\"raw\":\"%s\",%s}",
+             xs, ys, ts, isNg ? "NG" : "OK", (unsigned long)(cntCycles + 1), safe, prod);
   } else {
     snprintf(payload, sizeof(payload),
-             "{\"x\":null,\"y\":null,\"theta\":null,\"result\":\"%s\",\"valid\":false,\"cycle\":%lu,\"raw\":\"%s\"}",
-             isNg ? "NG" : "OK", (unsigned long)(cntCycles + 1), safe);
+             "{\"x\":null,\"y\":null,\"theta\":null,\"result\":\"%s\",\"valid\":false,\"cycle\":%lu,\"raw\":\"%s\",%s}",
+             isNg ? "NG" : "OK", (unsigned long)(cntCycles + 1), safe, prod);
   }
-  mqttEnqueue(payload);
+  mqttEnqueue(MQ_RESULT, payload);
   if (USE_MQTT && !mqttConnected) logEvent("MQTT", "offline - result queued (%u waiting)", (unsigned)mqttQCount);
+}
+
+// Logged on the Serial Monitor and published on MQTT_WARNING_TOPIC:
+//   {"warning":"SWITCH_NO_ACK","product":"ABCD","cycle":5,"state":"SWITCH_PROGRAM","detail":"..."}
+void publishWarning(const char* code, const char* fmt, ...) {
+  char detail[150];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(detail, sizeof(detail), fmt, args);
+  va_end(args);
+  logEvent("WARN", "%s %s", code, detail);
+  char safe[150], prod[PRODUCT_MAX + 4];
+  jsonSafe(safe, sizeof(safe), detail);
+  if (cycleProduct[0]) snprintf(prod, sizeof(prod), "\"%s\"", cycleProduct);
+  else strcpy(prod, "null");
+  char payload[MQTT_PAYLOAD_MAX];
+  snprintf(payload, sizeof(payload), "{\"warning\":\"%s\",\"product\":%s,\"cycle\":%lu,\"state\":\"%s\",\"detail\":\"%s\"}",
+           code, prod, (unsigned long)(cntCycles + 1), STATE_NAMES[state], safe);
+  mqttEnqueue(MQ_WARNING, payload);
+}
+
+// Called by mqttClient.poll() in the MQTT thread for every incoming message.
+static void onMqttMessage(int size) {
+  char payload[NETMSG_MAX];
+  size_t n = 0;
+  bool retained = mqttClient.messageRetain();
+  String topic = mqttClient.messageTopic();
+  while (mqttClient.available()) {
+    int c = mqttClient.read();
+    if (c < 0) break;
+    if (n < sizeof(payload) - 1) payload[n++] = (char)c;
+  }
+  payload[n] = '\0';
+  (void)size;
+  if (topic != MQTT_PRODUCT_TOPIC) return;
+  if (retained) { netPost(NM_MQTT, millis(), "retained (old) message on %s ignored", MQTT_PRODUCT_TOPIC); return; }
+  netPost(NM_PRODUCT, millis(), "%s", payload);
 }
 
 void mqttTask() {
@@ -1021,6 +1319,8 @@ void mqttTask() {
   mqttClient.setUsernamePassword(MQTT_USERNAME, MQTT_PASSWORD);
   mqttClient.setKeepAliveInterval(MQTT_KEEPALIVE_MS);
   mqttClient.setConnectionTimeout(5000);
+  mqttClient.onMessage(onMqttMessage);
+  uint8_t topic = MQ_RESULT;
 
   for (;;) {
     // ---- 1. network for MQTT ----
@@ -1063,11 +1363,14 @@ void mqttTask() {
       }
       mqttConnected = true;
       netPost(NM_MQTT, millis(), "connected to broker %s:%u as \"%s\"", brokerText, MQTT_BROKER_PORT, MQTT_CLIENT_ID);
+      if (mqttClient.subscribe(MQTT_PRODUCT_TOPIC, 1)) netPost(NM_MQTT, millis(), "subscribed to %s", MQTT_PRODUCT_TOPIC);
+      else netPost(NM_MQTT, millis(), "subscribe to %s FAILED - product names will not arrive", MQTT_PRODUCT_TOPIC);
     }
 
     // ---- 3. publish queued results ----
-    while (mqttPeek(payload)) {
-      bool ok = mqttClient.beginMessage(MQTT_TOPIC, strlen(payload), MQTT_RETAIN, MQTT_QOS) &&
+    while (mqttPeek(payload, topic)) {
+      const char* t = (topic == MQ_WARNING) ? MQTT_WARNING_TOPIC : MQTT_TOPIC;
+      bool ok = mqttClient.beginMessage(t, strlen(payload), MQTT_RETAIN, MQTT_QOS) &&
                 mqttClient.print(payload) == strlen(payload) &&
                 mqttClient.endMessage();
       if (!ok) {
@@ -1078,7 +1381,7 @@ void mqttTask() {
       }
       mqttPopFront();
       mqttPublished++;
-      netPost(NM_MQTT, millis(), "published to %s: %s", MQTT_TOPIC, payload);
+      netPost(NM_MQTT, millis(), "published to %s: %s", t, payload);
     }
 
     mqttClient.poll();                                       // keep-alive (PINGREQ)
@@ -1119,10 +1422,11 @@ void checkEthernetLink(unsigned long now) {
 
 void warningText(uint8_t w, char* out, size_t size) {
   if (w == 0) { snprintf(out, size, "NONE"); return; }
-  snprintf(out, size, "%s%s%s",
+  snprintf(out, size, "%s%s%s%s",
            (w & W_EXIT_BLOCKED)   ? "EXIT_BLOCKED|"   : "",
            (w & W_CAMERA_OFFLINE) ? "CAMERA_OFFLINE|" : "",
-           (w & W_ETH_LINK_DOWN)  ? "ETH_LINK_DOWN|"  : "");
+           (w & W_ETH_LINK_DOWN)  ? "ETH_LINK_DOWN|"  : "",
+           (w & W_SWITCH_NO_ACK)  ? "SWITCH_NO_ACK|"  : "");
   size_t n = strlen(out);
   if (n > 0 && out[n - 1] == '|') out[n - 1] = '\0';
 }
@@ -1133,17 +1437,22 @@ void buildStatus(char* out, size_t size) {
   fmtFixed(xs, sizeof(xs), lastX); fmtFixed(ys, sizeof(ys), lastY); fmtFixed(ts, sizeof(ts), lastTheta);
   snprintf(out, size,
            "STATUS state=%s fault=%s warn=%s S1=%d S2=%d S3=%d motor=%d alarm=%d ng=%d "
-           "camera=%d link=%d mqtt=%d mqtt_queue=%u last=%s result=%s x=%s y=%s theta=%s cycles=%lu ok=%lu ngcount=%lu faults=%lu uptime=%lu",
+           "camera=%d link=%d mqtt=%d mqtt_queue=%u product=%s next_product=%s switch=%s "
+           "last=%s result=%s x=%s y=%s theta=%s cycles=%lu ok=%lu ngcount=%lu faults=%lu uptime=%lu",
            STATE_NAMES[state], FAULT_NAMES[fault], w,
            s1.state, s2.state, s3.state, motorOn, alarmOut, ngLamp,
-           cameraConnected(), linkUp, (int)mqttConnected, (unsigned)mqttQCount, RESULT_NAMES[lastResultClass], lastCamResult, xs, ys, ts,
+           cameraConnected(), linkUp, (int)mqttConnected, (unsigned)mqttQCount,
+           cycleProduct[0] ? cycleProduct : "-", pendingProduct[0] ? pendingProduct : "-",
+           switchOk ? "OK" : (switchWarn ? "NO_ACK" : (switchSent ? "WAIT" : "-")),
+           RESULT_NAMES[lastResultClass], lastCamResult, xs, ys, ts,
            (unsigned long)cntCycles, (unsigned long)cntOk, (unsigned long)cntNg,
            (unsigned long)cntFaults, millis() / 1000UL);
 }
 
 void printHelp(Print& out) {
-  out.println("Commands: HELP | PING | STATUS | RESET | START | STOP | SIM <text> | TRIG | RECONNECT | CLEAR | VERSION");
-  out.println("  SIM <text> : inject a camera result (only used in WAIT_RESULT), e.g. SIM 12.5;30.2;45.0;OK;");
+  out.println("Commands: HELP | PING | STATUS | RESET | START | STOP | SIM <text> | TRIG | RECONNECT | PRODUCT <name> | CLEAR | VERSION");
+  out.println("  SIM <text> : inject a camera message: a result in WAIT_RESULT (SIM 12.5;30.2;45.0;OK;), the switch ack in SWITCH_PROGRAM (SIM ok)");
+  out.println("  PRODUCT <name> : product name for the next cycle (as if received on MQTT)");
   out.println("  TRIG       : send the camera trigger now (tests the camera link)");
   out.println("  RECONNECT  : drop the camera connection (client mode reconnects, server mode waits for the camera)");
 }
@@ -1157,7 +1466,7 @@ void processCommand(char* line, Print& out, const char* source) {
   if (strcmp(line, "PING") == 0) {
     out.println("PONG");
   } else if (strcmp(line, "STATUS") == 0) {
-    char st[380];
+    char st[560];
     buildStatus(st, sizeof(st));
     out.println(st);
   } else if (strcmp(line, "RESET") == 0 || strcmp(line, "START") == 0) {
@@ -1166,12 +1475,15 @@ void processCommand(char* line, Print& out, const char* source) {
     requestStop(source, out);
   } else if (strcmp(line, "SIM") == 0) {
     if (!arg || !*arg) { out.println("ERR usage: SIM <text>"); return; }
-    if (state != ST_WAIT_RESULT) {
-      out.print("ERR not waiting for a result, state="); out.println(STATE_NAMES[state]);
+    if (state != ST_WAIT_RESULT && state != ST_SWITCH_PROGRAM) {
+      out.print("ERR not waiting for the camera, state="); out.println(STATE_NAMES[state]);
       return;
     }
-    out.println("OK result injected");
-    acceptResult(arg, "sim", millis());
+    out.println("OK injected");
+    handleCameraData(arg, "sim", millis());
+  } else if (strcmp(line, "PRODUCT") == 0) {
+    if (!arg || !*arg) { out.println("ERR usage: PRODUCT <name>"); return; }
+    out.println(handleProductMessage(arg, source) ? "OK product set" : "ERR product name rejected");
   } else if (strcmp(line, "TRIG") == 0) {
     fireCameraTrigger(source);
   } else if (strcmp(line, "RECONNECT") == 0) {

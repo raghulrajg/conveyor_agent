@@ -20,7 +20,8 @@
      RUN_TO_CAMERA   S2 detects object .......................... motor OFF
      SETTLE          wait for the belt to stop
      WAIT_PRODUCT    wait for this part's product name (MQTT, every cycle)
-     SWITCH_PROGRAM  send "switch <product>" to the camera, wait for "ok"
+     SWITCH_PROGRAM  wait until the camera has answered "ok" to the
+                     "switch <product>" sent when the name arrived
                      (no "ok" within 10 s -> warning, the cycle continues)
      WAIT_RESULT     optionally trigger camera, wait for the camera result
      -> result       published to MQTT; S3 clear ................ motor ON
@@ -118,13 +119,18 @@
      Each product has its own program on the camera. Every cycle needs the
      product name of the part on the belt, received on MQTT_PRODUCT_TOPIC:
        {"product":"ABCD", ...}  (the scheduler's qc/qc_01/request)  or plain  ABCD
-     When the part has settled at S2 the Opta sends  switch ABCD  to the
-     camera over the camera TCP link and waits SWITCH_ACK_TIMEOUT_MS (10 s)
-     for "ok". Without "ok" a warning is shown (OUTPUT 2 blinking) and
-     published on MQTT_WARNING_TOPIC, and the cycle continues; the result
-     carries "switch_ok":false. No product name within
-     PRODUCT_WAIT_TIMEOUT_MS -> FAULT NO_PRODUCT. A product name is used
-     for ONE cycle only. Serial command  PRODUCT ABCD  sets it by hand.
+     As soon as the name arrives the Opta sends  switch ABCD  to the camera
+     over the camera TCP link (not waiting for the part to reach S2), so the
+     program is normally loaded before the part gets there. It waits
+     SWITCH_ACK_TIMEOUT_MS (10 s) for "ok". Without "ok" a warning is shown
+     (OUTPUT 2 blinking) and published on MQTT_WARNING_TOPIC, and the cycle
+     continues; the result carries "switch_ok":false. The camera is never
+     switched while it is inspecting a part (SWITCH_PROGRAM / WAIT_RESULT):
+     the switch then goes out right after that part's result.
+     At S2 the part waits only for whatever is left of the 10 s.
+     No product name within PRODUCT_WAIT_TIMEOUT_MS -> FAULT NO_PRODUCT.
+     A product name is used for ONE cycle only. Serial command
+     PRODUCT ABCD  sets it by hand.
 
    Board package: "Arduino Mbed OS Opta Boards", board "Arduino Opta",
    target core "Main Core" (M7).
@@ -342,8 +348,10 @@ void acceptResult(const char* msg, const char* source, unsigned long receivedAt)
 void handleCameraData(const char* msg, const char* source, unsigned long receivedAt);
 bool handleProductMessage(const char* payload, const char* source);
 bool takePendingProduct(unsigned long now);
-void requestProgramSwitch();
-void publishWarning(const char* code, const char* fmt, ...);
+void startProgramSwitch(const char* product, uint32_t seq);
+void serviceProgramSwitch(unsigned long now);
+bool cycleSwitchOk();
+void publishWarning(const char* code, const char* product, const char* fmt, ...);
 struct CamResult {
   bool valid;          // x, y, theta are numbers and a result field is present
   float x, y, theta;
@@ -397,12 +405,22 @@ char lastResultText[48] = "-";
 uint32_t cntCycles = 0, cntOk = 0, cntNg = 0, cntFaults = 0;
 
 // ---- product of the part on the belt (one name per cycle) ----
+// Every received product name gets a sequence number, so the program switch
+// started when it arrived stays tied to that name (pending -> cycle).
 char pendingProduct[PRODUCT_MAX] = "";      // received, not yet used by a cycle
 unsigned long pendingProductAt = 0;
+uint32_t pendingSeq = 0;
+bool pendingNeedsSwitch = false;            // "switch <pending>" not sent yet (camera busy / offline)
 char cycleProduct[PRODUCT_MAX] = "";        // the current cycle's product ("" = none)
-bool switchSent = false;                    // "switch <product>" requested this cycle
-bool switchOk = false;                      // camera answered "ok"
-bool switchWarn = false;                    // no "ok" this cycle (warning indication)
+uint32_t cycleSeq = 0;
+bool cycleNeedsSwitch = false;
+uint32_t productSeq = 0;
+
+enum SwitchState : uint8_t { SW_NONE, SW_WAITING, SW_OK, SW_NO_ACK };
+const char* const SWITCH_NAMES[] = { "-", "WAIT", "OK", "NO_ACK" };
+SwitchState switchState = SW_NONE;          // of the last "switch <product>" sent
+uint32_t switchSeq = 0;                     // which product name it was for
+char switchProduct[PRODUCT_MAX] = "";
 unsigned long switchSentAt = 0;
 
 // ---- shared between loop() and the camera thread ----
@@ -472,23 +490,21 @@ void enterState(State s, const char* reason) {
   logEvent("STATE", "%s->%s %s", STATE_NAMES[old], STATE_NAMES[s], reason);
 
   if (old == ST_IDLE && s != ST_STOPPED && s != ST_FAULT) {
-    // a new cycle: it needs its own product name
-    cycleProduct[0] = '\0';
-    switchSent = switchOk = switchWarn = false;
+    cycleProduct[0] = '\0';                // a new cycle: it needs its own product name
+    cycleNeedsSwitch = false;
   }
 
   switch (s) {
     case ST_IDLE:
       cycleProduct[0] = '\0';              // a product name is used for one cycle only
-      switchWarn = false;
+      cycleNeedsSwitch = false;
       break;
     case ST_RUN_TO_CAMERA:
       ngLamp = false;                       // new product, clear old NG lamp
       break;
     case ST_SWITCH_PROGRAM:
-      switchSent = switchOk = false;
-      if (cameraConnected()) requestProgramSwitch();
-      else logEvent("WARN", "camera not connected - \"switch %s\" is sent when it connects", cycleProduct);
+      if (cycleNeedsSwitch && !cameraConnected())
+        logEvent("WARN", "camera not connected - \"%s%s\" is sent when it connects", SWITCH_COMMAND_PREFIX, cycleProduct);
       break;
     case ST_WAIT_RESULT: {
       // Only camera data that starts arriving from now on is accepted (see acceptResult).
@@ -521,12 +537,16 @@ static void keepProductForRestart(bool afterFault) {
   if (keep && cycleProduct[0] && !pendingProduct[0]) {
     strcpy(pendingProduct, cycleProduct);
     pendingProductAt = millis();
+    pendingSeq = cycleSeq;                   // same name: its switch result still counts
+    pendingNeedsSwitch = !(switchSeq == cycleSeq && switchState == SW_OK);   // resend unless confirmed
     logEvent("PRODUCT", "\"%s\" kept for the part on the belt", pendingProduct);
   } else if (!keep && pendingProduct[0]) {
     logEvent("PRODUCT", "\"%s\" discarded by the reset", pendingProduct);
     pendingProduct[0] = '\0';
+    pendingNeedsSwitch = false;
   }
   cycleProduct[0] = '\0';
+  cycleNeedsSwitch = false;
 }
 
 void requestReset(const char* source, Print& out) {
@@ -558,6 +578,7 @@ void requestStop(const char* source, Print& out) {
 }
 
 void runStateMachine(unsigned long now) {
+  serviceProgramSwitch(now);
   unsigned long inState = now - stateSince;
 
   switch (state) {
@@ -587,21 +608,28 @@ void runStateMachine(unsigned long now) {
         break;
       }
       if (inState > PRODUCT_WAIT_TIMEOUT_MS) {
-        publishWarning("NO_PRODUCT", "no product name within %lu s (topic %s)",
+        publishWarning("NO_PRODUCT", nullptr, "no product name within %lu s (topic %s)",
                        PRODUCT_WAIT_TIMEOUT_MS / 1000UL, MQTT_PRODUCT_TOPIC);
         raiseFault(F_NO_PRODUCT, "no product name received for the part at the camera");
       }
       break;
 
     case ST_SWITCH_PROGRAM:
-      // "ok" from the camera arrives through handleCameraData().
-      if (!switchSent && cameraConnected()) requestProgramSwitch();
-      if (inState > SWITCH_ACK_TIMEOUT_MS) {
-        switchWarn = true;
-        publishWarning("SWITCH_NO_ACK", "no \"%s\" from the camera within %lu s after \"%s%s\"%s",
-                       SWITCH_ACK, SWITCH_ACK_TIMEOUT_MS / 1000UL, SWITCH_COMMAND_PREFIX, cycleProduct,
-                       switchSent ? "" : " (camera not connected, not sent)");
+      // The switch was sent when the product name arrived (or is sent now by
+      // serviceProgramSwitch); the "ok" arrives through handleCameraData().
+      if (switchSeq == cycleSeq && switchState == SW_OK) { enterState(ST_WAIT_RESULT, "program ready"); break; }
+      if (switchSeq == cycleSeq && switchState == SW_NO_ACK) {
         enterState(ST_WAIT_RESULT, "no switch ack - continuing");
+        break;
+      }
+      if (cycleNeedsSwitch && inState > SWITCH_ACK_TIMEOUT_MS) {      // camera offline the whole time
+        publishWarning("SWITCH_NO_ACK", cycleProduct, "\"%s%s\" not sent: camera not connected for %lu s",
+                       SWITCH_COMMAND_PREFIX, cycleProduct, SWITCH_ACK_TIMEOUT_MS / 1000UL);
+        cycleNeedsSwitch = false;
+        switchSeq = cycleSeq;
+        switchState = SW_NO_ACK;
+        strcpy(switchProduct, cycleProduct);
+        enterState(ST_WAIT_RESULT, "camera offline - continuing");
       }
       break;
 
@@ -660,7 +688,9 @@ void updateWarnings(unsigned long now) {
   if (state == ST_WAIT_EXIT_CLEAR && (now - stateSince) >= EXIT_BLOCKED_WARN_MS) w |= W_EXIT_BLOCKED;
   if (!cameraConnected() && now > CAMERA_BOOT_GRACE_MS) w |= W_CAMERA_OFFLINE;
   if (!linkUp) w |= W_ETH_LINK_DOWN;
-  if (switchWarn) w |= W_SWITCH_NO_ACK;
+  // no "ok" for the product of the part on the belt, or of the next part
+  if (switchState == SW_NO_ACK && ((cycleProduct[0] && switchSeq == cycleSeq) ||
+                                   (pendingProduct[0] && switchSeq == pendingSeq))) w |= W_SWITCH_NO_ACK;
 
   if (w != warnings) {
     char txt[64];
@@ -847,7 +877,7 @@ static bool extractProduct(const char* payload, char* out, size_t size) {
 bool handleProductMessage(const char* payload, const char* source) {
   char name[PRODUCT_MAX + 8];
   if (!extractProduct(payload, name, sizeof(name)) || !validProductName(name)) {
-    publishWarning("PRODUCT_REJECTED", "bad product name from %s (A-Z a-z 0-9 space _ - . max 64): %.80s",
+    publishWarning("PRODUCT_REJECTED", nullptr, "bad product name from %s (A-Z a-z 0-9 space _ - . max 64): %.80s",
                    source, payload);
     return false;
   }
@@ -856,7 +886,10 @@ bool handleProductMessage(const char* payload, const char* source) {
   }
   strcpy(pendingProduct, name);
   pendingProductAt = millis();
+  pendingSeq = ++productSeq;
+  pendingNeedsSwitch = true;                 // switched right away by serviceProgramSwitch()
   logEvent("PRODUCT", "\"%s\" received from %s (state %s)", pendingProduct, source, STATE_NAMES[state]);
+  serviceProgramSwitch(millis());
   return true;
 }
 
@@ -864,34 +897,65 @@ bool handleProductMessage(const char* payload, const char* source) {
 bool takePendingProduct(unsigned long now) {
   if (!pendingProduct[0]) return false;
   if (now - pendingProductAt > PRODUCT_MAX_AGE_MS) {
-    publishWarning("PRODUCT_STALE", "product \"%s\" discarded: received %lu s ago, before this part",
+    publishWarning("PRODUCT_STALE", pendingProduct, "product \"%s\" discarded: received %lu s ago, before this part",
                    pendingProduct, (now - pendingProductAt) / 1000UL);
     pendingProduct[0] = '\0';
+    pendingNeedsSwitch = false;
     return false;
   }
   strcpy(cycleProduct, pendingProduct);
+  cycleSeq = pendingSeq;
+  cycleNeedsSwitch = pendingNeedsSwitch;
   pendingProduct[0] = '\0';
+  pendingNeedsSwitch = false;
   return true;
 }
 
-void requestProgramSwitch() {
+void startProgramSwitch(const char* product, uint32_t seq) {
   netMutex.lock();
-  strcpy(camSwitchProduct, cycleProduct);
+  strcpy(camSwitchProduct, product);
   netMutex.unlock();
-  switchSent = true;
+  strcpy(switchProduct, product);
+  switchSeq = seq;
+  switchState = SW_WAITING;
   switchSentAt = millis();
   camSwitchRequest = true;                   // the camera thread sends it
-  logEvent("SWITCH", "\"%s%s\" requested, waiting %lu s for \"%s\"", SWITCH_COMMAND_PREFIX, cycleProduct,
+  logEvent("SWITCH", "\"%s%s\" requested, waiting %lu s for \"%s\"", SWITCH_COMMAND_PREFIX, product,
            SWITCH_ACK_TIMEOUT_MS / 1000UL, SWITCH_ACK);
+}
+
+// Sends "switch <product>" as soon as a product name is known and the camera
+// is free, and times out the wait for "ok". Runs every scan.
+void serviceProgramSwitch(unsigned long now) {
+  if (switchState == SW_WAITING && now - switchSentAt > SWITCH_ACK_TIMEOUT_MS) {
+    switchState = SW_NO_ACK;
+    publishWarning("SWITCH_NO_ACK", switchProduct, "no \"%s\" from the camera within %lu s after \"%s%s\"",
+                   SWITCH_ACK, SWITCH_ACK_TIMEOUT_MS / 1000UL, SWITCH_COMMAND_PREFIX, switchProduct);
+  }
+  if (!cameraConnected()) return;
+  if (cycleNeedsSwitch && state == ST_SWITCH_PROGRAM) {          // this part's name, camera was offline
+    cycleNeedsSwitch = false;
+    startProgramSwitch(cycleProduct, cycleSeq);
+    return;
+  }
+  // The next part's name: never switch while the camera inspects the part at S2.
+  if (pendingNeedsSwitch && state != ST_SWITCH_PROGRAM && state != ST_WAIT_RESULT) {
+    pendingNeedsSwitch = false;
+    startProgramSwitch(pendingProduct, pendingSeq);
+  }
+}
+
+bool cycleSwitchOk() {
+  return cycleProduct[0] && switchSeq == cycleSeq && switchState == SW_OK;
 }
 
 // Every message from the camera: the "ok" of a program switch, or an inspection result.
 void handleCameraData(const char* msg, const char* source, unsigned long receivedAt) {
   if (isSwitchAck(msg)) {
-    if (state == ST_SWITCH_PROGRAM && switchSent && (long)(receivedAt - switchSentAt) >= 0) {
-      switchOk = true;
-      logEvent("SWITCH", "camera program \"%s\" active (%lu ms)", cycleProduct, millis() - switchSentAt);
-      enterState(ST_WAIT_RESULT, "switch ok");
+    if (switchState == SW_WAITING && (long)(receivedAt - switchSentAt) >= 0) {
+      switchState = SW_OK;
+      logEvent("SWITCH", "camera program \"%s\" active (%lu ms)", switchProduct, millis() - switchSentAt);
+      if (state == ST_SWITCH_PROGRAM && switchSeq == cycleSeq) enterState(ST_WAIT_RESULT, "switch ok");
     } else {
       logEvent("IGNORED", "\"%s\" from %s in state %s (no switch pending)", msg, source, STATE_NAMES[state]);
     }
@@ -1245,7 +1309,7 @@ static void jsonSafe(char* out, size_t size, const char* in) {
 
 // "product":"ABCD","switch_ok":true   (null, null when the cycle had no product name)
 static void productFields(char* out, size_t size) {
-  if (cycleProduct[0]) snprintf(out, size, "\"product\":\"%s\",\"switch_ok\":%s", cycleProduct, switchOk ? "true" : "false");
+  if (cycleProduct[0]) snprintf(out, size, "\"product\":\"%s\",\"switch_ok\":%s", cycleProduct, cycleSwitchOk() ? "true" : "false");
   else snprintf(out, size, "\"product\":null,\"switch_ok\":null");
 }
 
@@ -1272,7 +1336,8 @@ void publishResult(const CamResult& r, bool isNg, const char* raw) {
 
 // Logged on the Serial Monitor and published on MQTT_WARNING_TOPIC:
 //   {"warning":"SWITCH_NO_ACK","product":"ABCD","cycle":5,"state":"SWITCH_PROGRAM","detail":"..."}
-void publishWarning(const char* code, const char* fmt, ...) {
+// product: the name the warning is about (nullptr = the current cycle's, if any)
+void publishWarning(const char* code, const char* product, const char* fmt, ...) {
   char detail[150];
   va_list args;
   va_start(args, fmt);
@@ -1281,7 +1346,8 @@ void publishWarning(const char* code, const char* fmt, ...) {
   logEvent("WARN", "%s %s", code, detail);
   char safe[150], prod[PRODUCT_MAX + 4];
   jsonSafe(safe, sizeof(safe), detail);
-  if (cycleProduct[0]) snprintf(prod, sizeof(prod), "\"%s\"", cycleProduct);
+  if (!product) product = cycleProduct;
+  if (product[0]) snprintf(prod, sizeof(prod), "\"%s\"", product);
   else strcpy(prod, "null");
   char payload[MQTT_PAYLOAD_MAX];
   snprintf(payload, sizeof(payload), "{\"warning\":\"%s\",\"product\":%s,\"cycle\":%lu,\"state\":\"%s\",\"detail\":\"%s\"}",
@@ -1437,13 +1503,13 @@ void buildStatus(char* out, size_t size) {
   fmtFixed(xs, sizeof(xs), lastX); fmtFixed(ys, sizeof(ys), lastY); fmtFixed(ts, sizeof(ts), lastTheta);
   snprintf(out, size,
            "STATUS state=%s fault=%s warn=%s S1=%d S2=%d S3=%d motor=%d alarm=%d ng=%d "
-           "camera=%d link=%d mqtt=%d mqtt_queue=%u product=%s next_product=%s switch=%s "
+           "camera=%d link=%d mqtt=%d mqtt_queue=%u product=%s next_product=%s switch=%s(%s) "
            "last=%s result=%s x=%s y=%s theta=%s cycles=%lu ok=%lu ngcount=%lu faults=%lu uptime=%lu",
            STATE_NAMES[state], FAULT_NAMES[fault], w,
            s1.state, s2.state, s3.state, motorOn, alarmOut, ngLamp,
            cameraConnected(), linkUp, (int)mqttConnected, (unsigned)mqttQCount,
            cycleProduct[0] ? cycleProduct : "-", pendingProduct[0] ? pendingProduct : "-",
-           switchOk ? "OK" : (switchWarn ? "NO_ACK" : (switchSent ? "WAIT" : "-")),
+           SWITCH_NAMES[switchState], switchProduct[0] ? switchProduct : "-",
            RESULT_NAMES[lastResultClass], lastCamResult, xs, ys, ts,
            (unsigned long)cntCycles, (unsigned long)cntOk, (unsigned long)cntNg,
            (unsigned long)cntFaults, millis() / 1000UL);
@@ -1451,7 +1517,7 @@ void buildStatus(char* out, size_t size) {
 
 void printHelp(Print& out) {
   out.println("Commands: HELP | PING | STATUS | RESET | START | STOP | SIM <text> | TRIG | RECONNECT | PRODUCT <name> | CLEAR | VERSION");
-  out.println("  SIM <text> : inject a camera message: a result in WAIT_RESULT (SIM 12.5;30.2;45.0;OK;), the switch ack in SWITCH_PROGRAM (SIM ok)");
+  out.println("  SIM <text> : inject a camera message: a result in WAIT_RESULT (SIM 12.5;30.2;45.0;OK;), the switch ack while a switch waits for it (SIM ok)");
   out.println("  PRODUCT <name> : product name for the next cycle (as if received on MQTT)");
   out.println("  TRIG       : send the camera trigger now (tests the camera link)");
   out.println("  RECONNECT  : drop the camera connection (client mode reconnects, server mode waits for the camera)");
@@ -1475,7 +1541,7 @@ void processCommand(char* line, Print& out, const char* source) {
     requestStop(source, out);
   } else if (strcmp(line, "SIM") == 0) {
     if (!arg || !*arg) { out.println("ERR usage: SIM <text>"); return; }
-    if (state != ST_WAIT_RESULT && state != ST_SWITCH_PROGRAM) {
+    if (state != ST_WAIT_RESULT && state != ST_SWITCH_PROGRAM && switchState != SW_WAITING) {
       out.print("ERR not waiting for the camera, state="); out.println(STATE_NAMES[state]);
       return;
     }
